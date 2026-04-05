@@ -1,0 +1,115 @@
+{
+  "animations": {
+    "idle": {
+      "variants": []
+    },
+    "walk": {
+      "variants": [
+        {
+          "name": "default",
+          "path": "assets/sprites/walk/default",
+          "format": "frames"
+        }
+      ]
+    },
+    "run": {
+      "variants": []
+    },
+    "jump": {
+      "variants": []
+    },
+    "teach": {
+      "variants": []
+    },
+    "sleep": {
+      "variants": []
+    },
+    "listen": {
+      "variants": []
+    },
+    "think": {
+      "variants": [
+        {
+          "name": "default",
+          "path": "assets/sprites/think/default",
+          "format": "frames"
+        }
+      ]
+    },
+    "talk": {
+      "variants": []
+    },
+    "happy": {
+      "variants": []
+    }
+  },
+  "transitions": {
+    "sleep_to_idle": {
+      "variants": []
+    },
+    "idle_to_sleep": {
+      "variants": []
+    },
+    "idle_to_walk": {
+      "variants": []
+    },
+    "walk_to_idle": {
+      "variants": []
+    },
+    "idle_to_run": {
+      "variants": []
+    },
+    "run_to_idle": {
+      "variants": []
+    },
+    "walk_to_run": {
+      "variants": []
+    },
+    "run_to_walk": {
+      "variants": []
+    },
+    "idle_to_listen": {
+      "variants": []
+    },
+    "listen_to_idle": {
+      "variants": []
+    },
+    "idle_to_talk": {
+      "variants": []
+    },
+    "talk_to_idle": {
+      "variants": []
+    },
+    "idle_to_happy": {
+      "variants": []
+    },
+    "happy_to_idle": {
+      "variants": []
+    },
+    "think_to_talk": {
+      "variants": []
+    }
+  },
+  "state_type_map": {
+    "IDLE": "idle",
+    "WALK_RIGHT": "walk",
+    "WALK_LEFT": "walk",
+    "RUN_RIGHT": "run",
+    "RUN_LEFT": "run",
+    "SLEEP": "sleep",
+    "LISTEN": "listen",
+    "THINK": "think",
+    "TALK": "talk",
+    "HAPPY": "happy"
+  },
+  "fallbacks": {
+    "sleep": "idle",
+    "listen": "idle",
+    "think": "idle",
+    "talk": "teach",
+    "happy": "jump",
+    "run": "walk",
+    "jump": "idle",
+    "teach": "idle"
+  }
+}

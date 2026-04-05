@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+
+# IDE
+.idea/
+*.iml
+
+# Claude
+.claude/
+
+# Data (user-specific)
+whiskers/data/user_settings.json
+whiskers/data/student_memory.json
+whiskers/data/conversation_log.json
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
