@@ -6,12 +6,14 @@ openai>=1.0.0
 anthropic>=0.30.0
 
 # Speech recognition (optional — app falls back to F9 hotkey if missing)
-RealtimeSTT>=0.3.0; python_version < "3.13"
-faster-whisper>=1.0.0; python_version < "3.13"
+# RealtimeSTT pins scipy==1.15.2 and depends on webrtcvad-wheels==2.0.14;
+# neither ships cp314 Windows wheels, so we gate these two to <3.14 until upstream loosens.
+RealtimeSTT>=0.3.0; python_version < "3.14"
+faster-whisper>=1.0.0; python_version < "3.14"
 openwakeword>=0.6.0
 
 # Text to speech (optional — app falls back to pyttsx3 if missing)
-kokoro>=0.7.0; python_version < "3.13"
+kokoro>=0.7.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 
@@ -27,7 +29,7 @@ numpy>=1.24.0
 requests>=2.31.0
 
 # Audio capture (for wake word — requires C++ Build Tools on Windows to compile)
-PyAudio>=0.2.13; python_version < "3.13"
+PyAudio>=0.2.13
 
 # Hotkey fallback
 keyboard>=0.13.5

@@ -6,9 +6,10 @@
     "walk": {
       "variants": [
         {
-          "name": "default",
-          "path": "assets/sprites/walk/default",
-          "format": "frames"
+          "name": "walk_right",
+          "path": "assets\\sprites\\walk\\walk_right",
+          "format": "frames",
+          "fps": 5
         }
       ]
     },
@@ -28,13 +29,7 @@
       "variants": []
     },
     "think": {
-      "variants": [
-        {
-          "name": "default",
-          "path": "assets/sprites/think/default",
-          "format": "frames"
-        }
-      ]
+      "variants": []
     },
     "talk": {
       "variants": []
@@ -87,6 +82,12 @@
       "variants": []
     },
     "think_to_talk": {
+      "variants": []
+    },
+    "idle_to_jump": {
+      "variants": []
+    },
+    "jump_to_idle": {
       "variants": []
     }
   },

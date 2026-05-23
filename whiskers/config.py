@@ -21,7 +21,8 @@ WAKE_WORD_MODELS = [
 QUIET_WORDS = ['goodbye', 'bye', "that's all", 'bye whiskers', 'see you later']
 
 # Whisper speech recognition
-WHISPER_MODEL = 'tiny'                  # tiny (fast) / base / small (accurate)
+WHISPER_MODEL = 'base.en'               # base.en (English-only, ~150MB, strong accuracy for kid voices).
+                                        # Alternatives: tiny / base / small.en / medium.en
 WHISPER_LANGUAGE = 'en'
 
 # AI providers
@@ -117,6 +118,11 @@ def _default_user_settings():
         'wake_word_model': 'hey_jarvis_v0.1',
         'wake_word_sensitivity': WAKE_WORD_SENSITIVITY,
         'quiet_words': list(QUIET_WORDS),
+        # Per-animation FPS overrides keyed by animation/transition name.
+        # Unset keys inherit CAT_FPS — see CatWindow._current_anim_fps.
+        'animation_fps': {},
+        # Microphone input device. None = system default; int = sd.query_devices() index.
+        'input_device_index': None,
     }
 
 

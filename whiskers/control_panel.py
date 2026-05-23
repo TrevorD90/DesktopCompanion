@@ -6,7 +6,32 @@ from tkinter import ttk, filedialog, messagebox
 
 import config
 import voice_output
-from animation_manager import ANIMATION_TYPES, TRANSITION_KEYS
+from animation_manager import ANIMATION_TYPES, TRANSITION_KEYS, inspect_gif
+
+# Probe sounddevice once at import. _SD_IMPORT_ERROR set => package or
+# PortAudio DLL missing (pip-install fix); _SD_IMPORT_ERROR None => package
+# loaded, so per-call errors are hardware/OS-level and need different guidance.
+_sd = None
+_SD_IMPORT_ERROR = None
+try:
+    import sounddevice as _sd
+except Exception as e:
+    _SD_IMPORT_ERROR = e
+    print(f'[WARNING] sounddevice unavailable ({e}). Mic test disabled.')
+
+
+def _classify_mic_error(exc, has_any_input, device_index):
+    """Map a sounddevice/PortAudio exception to a user-actionable message."""
+    msg = str(exc).lower()
+    if not has_any_input:
+        return ('No microphone detected. Plug in a mic, or enable an input '
+                'device in Windows Sound settings.')
+    if device_index is not None:
+        return f'Saved device #{device_index} unavailable — pick another below.'
+    if 'portaudio' in msg or 'host error' in msg or 'hostapi' in msg:
+        return (f'Audio system error — is Windows Audio service running? '
+                f'({exc})')
+    return f'Audio error: {exc}'
 
 
 class ControlPanel:
@@ -24,6 +49,8 @@ class ControlPanel:
                 'change_voice'   — callable(voice_name)
                 'get_anim_summary' — callable() -> dict[str, int]
                 'get_anim_variants' — callable(anim_type) -> list[dict]
+                'set_animation_fps' — callable(name: str, fps: int | None)
+                    Sets a per-animation FPS override; pass None to clear.
         """
         self._root = root
         self._callbacks = callbacks
@@ -63,11 +90,26 @@ class ControlPanel:
         self._scroll_frame.bind('<Configure>', _on_scroll_configure)
         self._canvas.bind('<Configure>', _on_canvas_configure)
 
-        # Mouse wheel scrolling
+        # Mouse wheel scrolling — bind only when pointer is over the panel,
+        # otherwise the global bind_all() hijacks scroll events for every
+        # other Toplevel (cat window, speech bubble) in this process.
         def _on_mousewheel(event):
             self._canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
 
-        self._canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        def _bind_wheel_on_enter(_event):
+            self._canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+        def _unbind_wheel_on_leave(_event):
+            try:
+                self._canvas.unbind_all('<MouseWheel>')
+            except Exception:
+                pass
+
+        self._canvas.bind('<Enter>', _bind_wheel_on_enter)
+        self._canvas.bind('<Leave>', _unbind_wheel_on_leave)
+
+        # Initialize lazy-created attributes up front so cleanup code is simpler.
+        self._mic_auto_stop_id = None
 
         self._build_ui()
 
@@ -187,21 +229,56 @@ class ControlPanel:
         mic_frame = ttk.LabelFrame(main, text='Microphone', padding=8)
         mic_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self._mic_test_btn = ttk.Button(mic_frame, text='Test Microphone',
+        # Input device selector row
+        dev_row = ttk.Frame(mic_frame)
+        dev_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(dev_row, text='Input Device:').pack(side=tk.LEFT, padx=(0, 6))
+
+        self._mic_devices = self._list_input_devices()  # [(index_or_None, label), ...]
+        self._mic_device_var = tk.StringVar()
+        self._mic_device_combo = ttk.Combobox(
+            dev_row, textvariable=self._mic_device_var,
+            values=[label for _, label in self._mic_devices],
+            state='readonly', width=42,
+        )
+        self._mic_device_combo.pack(side=tk.LEFT)
+        self._mic_device_combo.bind('<<ComboboxSelected>>', self._on_mic_device_changed)
+
+        ttk.Button(dev_row, text='Refresh',
+                   command=self._refresh_mic_devices).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Test button + status row
+        test_row = ttk.Frame(mic_frame)
+        test_row.pack(fill=tk.X)
+
+        self._mic_test_btn = ttk.Button(test_row, text='Test Microphone',
                                         command=self._on_test_mic)
         self._mic_test_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self._mic_status_label = ttk.Label(mic_frame, text='')
+        self._mic_status_label = ttk.Label(test_row, text='')
         self._mic_status_label.pack(side=tk.LEFT)
 
         # Level bar to show live audio level
-        self._mic_level = ttk.Progressbar(mic_frame, orient=tk.HORIZONTAL,
+        self._mic_level = ttk.Progressbar(test_row, orient=tk.HORIZONTAL,
                                           length=150, mode='determinate',
                                           maximum=100)
         self._mic_level.pack(side=tk.LEFT, padx=(8, 0))
 
         self._mic_testing = False
         self._mic_stream = None
+        self._mic_auto_stop_id = None
+
+        # Populate the dropdown from the persisted setting
+        self._sync_mic_device_selection()
+
+        # If sounddevice couldn't load at all, there's no point letting the
+        # user click Test — surface the package-install hint up front.
+        if _sd is None:
+            self._mic_test_btn.config(state='disabled')
+            self._mic_device_combo.config(state='disabled')
+            self._mic_status_label.config(
+                text='Python package missing — run: pip install sounddevice',
+                foreground='red')
 
         # --- Wake Word section ---
         wake_frame = ttk.LabelFrame(main, text='Wake Word', padding=8)
@@ -304,7 +381,15 @@ class ControlPanel:
 
         self._remove_btn = ttk.Button(btn_frame, text='Remove Selected',
                                       command=self._on_remove_animation)
-        self._remove_btn.pack(side=tk.LEFT)
+        self._remove_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._edit_fps_btn = ttk.Button(btn_frame, text='Edit FPS…',
+                                        command=self._on_edit_variant_fps)
+        self._edit_fps_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._import_sheet_btn = ttk.Button(btn_frame, text='Import Sprite Sheet…',
+                                            command=self._on_import_sprite_sheet)
+        self._import_sheet_btn.pack(side=tk.LEFT)
 
         # --- Transitions section ---
         trans_frame = ttk.LabelFrame(main, text='Transition Animations (between states)', padding=8)
@@ -332,7 +417,92 @@ class ControlPanel:
         ttk.Button(trans_btn_frame, text='Add Transition',
                    command=self._on_add_transition).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(trans_btn_frame, text='Remove Selected',
-                   command=self._on_remove_transition).pack(side=tk.LEFT)
+                   command=self._on_remove_transition).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(trans_btn_frame, text='Edit FPS…',
+                   command=self._on_edit_transition_variant_fps).pack(side=tk.LEFT)
+
+        # --- Frame Speeds section ---
+        fps_frame = ttk.LabelFrame(main, text='Frame Speeds', padding=8)
+        fps_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(fps_frame,
+                  text=f'Per-animation FPS (default {config.CAT_FPS}). Range 1–60.',
+                  foreground='gray').pack(anchor=tk.W, pady=(0, 6))
+
+        overrides = config.get_setting('animation_fps', {}) or {}
+        self._anim_fps_vars = {}  # name -> tk.IntVar
+
+        rows_frame = ttk.Frame(fps_frame)
+        rows_frame.pack(fill=tk.X)
+
+        # Two columns for compactness: base animations on the left, transitions on the right
+        left_col = ttk.Frame(rows_frame)
+        left_col.pack(side=tk.LEFT, anchor=tk.N, fill=tk.X, expand=True, padx=(0, 12))
+        right_col = ttk.Frame(rows_frame)
+        right_col.pack(side=tk.LEFT, anchor=tk.N, fill=tk.X, expand=True)
+
+        ttk.Label(left_col, text='Animations', font=('TkDefaultFont', 9, 'bold')) \
+            .pack(anchor=tk.W, pady=(0, 4))
+        for name in ANIMATION_TYPES:
+            self._build_fps_row(left_col, name, overrides)
+
+        ttk.Label(right_col, text='Transitions', font=('TkDefaultFont', 9, 'bold')) \
+            .pack(anchor=tk.W, pady=(0, 4))
+        for name in TRANSITION_KEYS:
+            self._build_fps_row(right_col, name, overrides)
+
+    def _build_fps_row(self, parent, name, overrides):
+        """Create one row: label + spinbox + 'fps' + Reset button."""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=1)
+
+        ttk.Label(row, text=name, width=18, anchor=tk.W).pack(side=tk.LEFT)
+
+        current = overrides.get(name, config.CAT_FPS)
+        try:
+            current = int(current)
+        except (TypeError, ValueError):
+            current = config.CAT_FPS
+        var = tk.IntVar(value=current)
+        self._anim_fps_vars[name] = var
+
+        spin = ttk.Spinbox(row, from_=1, to=60, width=4, textvariable=var,
+                           command=lambda n=name: self._on_fps_changed(n))
+        spin.pack(side=tk.LEFT, padx=(0, 4))
+        spin.bind('<Return>', lambda _e, n=name: self._on_fps_changed(n))
+        spin.bind('<FocusOut>', lambda _e, n=name: self._on_fps_changed(n))
+
+        ttk.Label(row, text='fps', foreground='gray').pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text='Reset', width=6,
+                   command=lambda n=name: self._on_fps_reset(n)).pack(side=tk.LEFT)
+
+    def _on_fps_changed(self, name):
+        """User edited a frame-speed spinbox. Clamp, push to CatWindow, persist."""
+        var = self._anim_fps_vars.get(name)
+        if var is None:
+            return
+        try:
+            fps = int(var.get())
+        except (tk.TclError, ValueError):
+            # Invalid entry — restore previous persisted value
+            overrides = config.get_setting('animation_fps', {}) or {}
+            var.set(int(overrides.get(name, config.CAT_FPS)))
+            return
+        fps = max(1, min(60, fps))
+        if fps != var.get():
+            var.set(fps)  # reflect the clamp back to the UI
+        cb = self._callbacks.get('set_animation_fps')
+        if cb:
+            cb(name, fps)
+
+    def _on_fps_reset(self, name):
+        """Clear a per-animation override so it inherits config.CAT_FPS."""
+        cb = self._callbacks.get('set_animation_fps')
+        if cb:
+            cb(name, None)
+        var = self._anim_fps_vars.get(name)
+        if var is not None:
+            var.set(config.CAT_FPS)
 
     def _on_close(self):
         """Hide window on close instead of destroying it."""
@@ -360,6 +530,16 @@ class ControlPanel:
         self._sensitivity_label.config(text=f'{self._sensitivity_var.get():.2f}')
         current_quiet = settings.get('quiet_words', config.QUIET_WORDS)
         self._quiet_words_var.set(', '.join(current_quiet))
+        # Sync mic device dropdown with persisted setting
+        self._sync_mic_device_selection()
+        # Sync frame-speed spinboxes with persisted overrides (in case they
+        # were changed outside the panel, e.g. via a settings-file edit)
+        fps_overrides = settings.get('animation_fps', {}) or {}
+        for name, var in getattr(self, '_anim_fps_vars', {}).items():
+            try:
+                var.set(int(fps_overrides.get(name, config.CAT_FPS)))
+            except (TypeError, ValueError):
+                var.set(config.CAT_FPS)
         self._window.deiconify()
         self._window.lift()
         self._window.focus_force()
@@ -439,25 +619,92 @@ class ControlPanel:
         voice_output.speak("Hi there! I'm your AI companion. How does this voice sound?")
         voice_output.set_voice(previous)
 
+    def _list_input_devices(self):
+        """Return [(device_index_or_None, display_label), ...] for all input devices.
+
+        Dropdown is self-describing when audio is unusable: a missing package
+        or empty enumeration shows a diagnostic entry instead of a bare
+        'System default' that the user might click optimistically.
+        """
+        if _sd is None:
+            return [(None, 'sounddevice not installed')]
+        out = [(None, 'System default')]
+        try:
+            for i, d in enumerate(_sd.query_devices()):
+                if d.get('max_input_channels', 0) > 0:
+                    out.append(
+                        (i, f"{i}: {d['name']} ({d['max_input_channels']} ch)"))
+        except Exception as e:
+            print(f'[WARNING] Could not list input devices: {e}')
+            return [(None, 'No input devices detected')]
+        if len(out) == 1:
+            return [(None, 'No input devices detected')]
+        return out
+
+    def _refresh_mic_devices(self):
+        """Re-enumerate input devices (e.g. after plugging in a USB mic)."""
+        self._mic_devices = self._list_input_devices()
+        self._mic_device_combo['values'] = [label for _, label in self._mic_devices]
+        self._sync_mic_device_selection()
+
+    def _sync_mic_device_selection(self):
+        """Match combobox text to the persisted input_device_index."""
+        current = config.get_setting('input_device_index', None)
+        for i, (idx, _label) in enumerate(self._mic_devices):
+            if idx == current:
+                self._mic_device_combo.current(i)
+                return
+        # Configured index not present — show "System default" and warn
+        if self._mic_devices:
+            self._mic_device_combo.current(0)
+        if current is not None:
+            self._mic_status_label.config(
+                text=f'Saved device #{current} not found — using default',
+                foreground='orange')
+
+    def _on_mic_device_changed(self, _event=None):
+        """User picked a different input device from the dropdown."""
+        i = self._mic_device_combo.current()
+        if i < 0 or i >= len(self._mic_devices):
+            return
+        idx, _label = self._mic_devices[i]
+        cb = self._callbacks.get('change_mic_device')
+        if cb:
+            cb(idx)
+
     def _on_test_mic(self):
-        """Toggle a 5-second microphone test with live level display."""
+        """Toggle a 10-second microphone test with live level display."""
         if self._mic_testing:
             self._stop_mic_test()
             return
 
-        # Try to open an audio input stream
-        try:
-            import sounddevice as _sd
-        except ImportError:
-            self._mic_status_label.config(text='sounddevice not installed', foreground='red')
+        if _sd is None:
+            self._mic_status_label.config(
+                text='Python package missing — run: pip install sounddevice',
+                foreground='red')
             return
 
+        device_index = config.get_setting('input_device_index')
+
         try:
-            # Query default input device to confirm one exists
-            dev = _sd.query_devices(kind='input')
+            if device_index is None:
+                dev = _sd.query_devices(kind='input')
+            else:
+                dev = _sd.query_devices(int(device_index))
             dev_name = dev['name']
-        except Exception:
-            self._mic_status_label.config(text='No microphone found', foreground='red')
+        except Exception as e:
+            # Figure out *why* the query failed to give actionable guidance.
+            has_any_input = False
+            try:
+                for d in _sd.query_devices():
+                    if d.get('max_input_channels', 0) > 0:
+                        has_any_input = True
+                        break
+            except Exception:
+                pass
+            self._mic_status_label.config(
+                text=_classify_mic_error(e, has_any_input, device_index),
+                foreground='red')
             self._mic_level['value'] = 0
             return
 
@@ -468,25 +715,32 @@ class ControlPanel:
         import numpy as _np
 
         def audio_callback(indata, frames, time_info, status):
-            # Compute RMS level as a percentage (0-100)
             rms = float(_np.sqrt(_np.mean(indata ** 2)))
-            # Scale: typical speech RMS ~0.01-0.1, clamp to 0-100
             level = min(100, int(rms * 1000))
-            # Schedule UI update on the tkinter thread
             try:
                 self._root.after(0, lambda l=level: self._mic_level.configure(value=l))
             except Exception:
                 pass
 
+        # Use the device's native sample rate. WASAPI (and some WDM-KS) entries
+        # reject arbitrary rates with PaErrorCode -9997 — every device accepts
+        # its default_samplerate, so we follow that and derive blocksize from it.
+        samplerate = int(dev.get('default_samplerate') or 16000)
+        blocksize = max(1, samplerate // 10)  # ~100 ms callback cadence
+
         try:
-            self._mic_stream = _sd.InputStream(
-                samplerate=16000, channels=1, dtype='float32',
-                blocksize=1600,  # 100ms chunks
-                callback=audio_callback
+            stream_kwargs = dict(
+                samplerate=samplerate, channels=1, dtype='float32',
+                blocksize=blocksize, callback=audio_callback,
             )
+            if device_index is not None:
+                stream_kwargs['device'] = int(device_index)
+            self._mic_stream = _sd.InputStream(**stream_kwargs)
             self._mic_stream.start()
         except Exception as e:
-            self._mic_status_label.config(text=f'Error: {e}', foreground='red')
+            self._mic_status_label.config(
+                text=f'Could not open {dev_name}: {e}. It may be in use by another app.',
+                foreground='red')
             self._mic_testing = False
             self._mic_test_btn.config(text='Test Microphone')
             return
@@ -499,7 +753,7 @@ class ControlPanel:
         self._mic_testing = False
         self._mic_test_btn.config(text='Test Microphone')
 
-        if hasattr(self, '_mic_auto_stop_id') and self._mic_auto_stop_id:
+        if self._mic_auto_stop_id:
             try:
                 self._root.after_cancel(self._mic_auto_stop_id)
             except Exception:
@@ -554,11 +808,10 @@ class ControlPanel:
             self._callbacks['change_quiet_words'](text)
 
     def _on_add_animation(self):
-        """Open dialog to add a new animation variant."""
-        # Create a small dialog for type selection + folder picking
+        """Open dialog to add a new animation variant (folder of frames OR single GIF)."""
         dialog = tk.Toplevel(self._window)
         dialog.title('Add Animation')
-        dialog.geometry('360x180')
+        dialog.geometry('420x280')
         dialog.resizable(False, False)
         dialog.transient(self._window)
         dialog.grab_set()
@@ -566,53 +819,137 @@ class ControlPanel:
         frame = ttk.Frame(dialog, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Animation type selector
+        # Animation type
         ttk.Label(frame, text='Animation Type:').grid(row=0, column=0, sticky=tk.W, pady=4)
         type_var = tk.StringVar(value=ANIMATION_TYPES[0])
-        type_combo = ttk.Combobox(frame, textvariable=type_var,
-                                  values=ANIMATION_TYPES, state='readonly', width=18)
-        type_combo.grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Combobox(frame, textvariable=type_var, values=ANIMATION_TYPES,
+                     state='readonly', width=18) \
+            .grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
 
         # Variant name
         ttk.Label(frame, text='Variant Name:').grid(row=1, column=0, sticky=tk.W, pady=4)
         name_var = tk.StringVar()
-        name_entry = ttk.Entry(frame, textvariable=name_var, width=20)
-        name_entry.grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Entry(frame, textvariable=name_var, width=20) \
+            .grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
 
-        # Folder path
-        ttk.Label(frame, text='Sprite Folder:').grid(row=2, column=0, sticky=tk.W, pady=4)
+        # Source radio
+        ttk.Label(frame, text='Source:').grid(row=2, column=0, sticky=tk.W, pady=4)
+        source_var = tk.StringVar(value='folder')
+        radio_frame = ttk.Frame(frame)
+        radio_frame.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
+        ttk.Radiobutton(radio_frame, text='Folder of frames', variable=source_var,
+                        value='folder').pack(side=tk.LEFT)
+        ttk.Radiobutton(radio_frame, text='Single GIF file', variable=source_var,
+                        value='gif').pack(side=tk.LEFT, padx=(10, 0))
+
+        # Path row
+        path_label = ttk.Label(frame, text='Sprite Folder:')
+        path_label.grid(row=3, column=0, sticky=tk.W, pady=4)
         path_var = tk.StringVar()
-        path_entry = ttk.Entry(frame, textvariable=path_var, width=20, state='readonly')
-        path_entry.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Entry(frame, textvariable=path_var, width=28, state='readonly') \
+            .grid(row=3, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+
+        # GIF metadata (shown only when a multi-frame GIF is selected)
+        frames_label = ttk.Label(frame, text='', foreground='gray')
+        frames_label.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        fps_label = ttk.Label(frame, text='FPS:')
+        fps_var = tk.IntVar(value=config.CAT_FPS)
+        fps_spin = ttk.Spinbox(frame, from_=1, to=60, width=4, textvariable=fps_var)
+        fps_hint = ttk.Label(frame, text='fps', foreground='gray')
+        fps_label.grid(row=5, column=0, sticky=tk.W, pady=4)
+        fps_spin.grid(row=5, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        fps_hint.grid(row=5, column=2, sticky=tk.W, pady=4)
+        fps_label.grid_remove()
+        fps_spin.grid_remove()
+        fps_hint.grid_remove()
+
+        # State carried back into submit()
+        gif_meta = {'frame_count': 0}
+
+        def refresh_gif_meta():
+            """Inspect the currently-picked GIF and show/hide the FPS row."""
+            gif_meta['frame_count'] = 0
+            frames_label.configure(text='')
+            fps_label.grid_remove()
+            fps_spin.grid_remove()
+            fps_hint.grid_remove()
+            if source_var.get() != 'gif':
+                return
+            p = path_var.get().strip()
+            if not p or not os.path.isfile(p):
+                return
+            count, hint = inspect_gif(p)
+            gif_meta['frame_count'] = count
+            if count <= 0:
+                frames_label.configure(text='(could not read GIF)')
+                return
+            frames_label.configure(text=f'Frames: {count}')
+            if count >= 2:
+                fps_var.set(int(hint))
+                fps_label.grid()
+                fps_spin.grid()
+                fps_hint.grid()
 
         def browse():
-            folder = filedialog.askdirectory(
-                title='Select folder with sprite frames',
-                parent=dialog
-            )
-            if folder:
-                path_var.set(folder)
+            if source_var.get() == 'gif':
+                picked = filedialog.askopenfilename(
+                    title='Select a GIF file',
+                    parent=dialog,
+                    filetypes=[('GIF images', '*.gif')],
+                )
+            else:
+                picked = filedialog.askdirectory(
+                    title='Select folder with sprite frames',
+                    parent=dialog,
+                )
+            if picked:
+                path_var.set(picked)
+                refresh_gif_meta()
 
-        browse_btn = ttk.Button(frame, text='Browse...', command=browse)
-        browse_btn.grid(row=2, column=2, padx=(4, 0), pady=4)
+        ttk.Button(frame, text='Browse...', command=browse) \
+            .grid(row=3, column=2, padx=(4, 0), pady=4)
+
+        def on_source_changed(*_):
+            path_var.set('')
+            if source_var.get() == 'gif':
+                path_label.configure(text='GIF File:')
+            else:
+                path_label.configure(text='Sprite Folder:')
+            refresh_gif_meta()
+
+        source_var.trace_add('write', on_source_changed)
 
         def submit():
             anim_type = type_var.get()
             variant_name = name_var.get().strip()
             source_path = path_var.get().strip()
+            source_type = source_var.get()
 
             if not variant_name:
                 messagebox.showwarning('Missing Name', 'Please enter a variant name.',
                                        parent=dialog)
                 return
-            if not source_path or not os.path.isdir(source_path):
-                messagebox.showwarning('Missing Folder', 'Please select a valid sprite folder.',
-                                       parent=dialog)
-                return
 
             try:
-                if 'add_animation' in self._callbacks:
-                    self._callbacks['add_animation'](anim_type, variant_name, source_path)
+                if source_type == 'gif':
+                    if not source_path or not os.path.isfile(source_path):
+                        messagebox.showwarning('Missing GIF',
+                                               'Please select a valid GIF file.',
+                                               parent=dialog)
+                        return
+                    fps = int(fps_var.get()) if gif_meta['frame_count'] >= 2 else None
+                    cb = self._callbacks.get('add_gif_animation')
+                    if cb is None:
+                        raise RuntimeError('add_gif_animation callback not wired')
+                    cb(anim_type, variant_name, source_path, fps)
+                else:
+                    if not source_path or not os.path.isdir(source_path):
+                        messagebox.showwarning('Missing Folder',
+                                               'Please select a valid sprite folder.',
+                                               parent=dialog)
+                        return
+                    if 'add_animation' in self._callbacks:
+                        self._callbacks['add_animation'](anim_type, variant_name, source_path)
                 self.refresh_animation_list()
                 dialog.destroy()
             except Exception as e:
@@ -620,7 +957,108 @@ class ControlPanel:
                                      parent=dialog)
 
         ttk.Button(frame, text='Add', command=submit).grid(
-            row=3, column=0, columnspan=3, pady=(12, 0))
+            row=6, column=0, columnspan=3, pady=(12, 0))
+
+    def _on_edit_variant_fps(self):
+        """Open dialog to edit the per-variant FPS of the selected animation variant."""
+        selected = self._tree.selection()
+        if not selected:
+            messagebox.showinfo('No Selection', 'Select a variant to edit.',
+                                parent=self._window)
+            return
+        item_id = selected[0]
+        parent_id = self._tree.parent(item_id)
+        if not parent_id:
+            messagebox.showinfo('Select Variant',
+                                'Please select a specific variant, not an animation type.',
+                                parent=self._window)
+            return
+        anim_type = self._tree.item(parent_id, 'text').lower()
+        variant_name = self._tree.item(item_id, 'text')
+        self._open_edit_fps_dialog(anim_type, variant_name, is_transition=False)
+
+    def _on_edit_transition_variant_fps(self):
+        """Open dialog to edit the per-variant FPS of the selected transition variant."""
+        selected = self._trans_tree.selection()
+        if not selected:
+            messagebox.showinfo('No Selection', 'Select a transition variant to edit.',
+                                parent=self._window)
+            return
+        item_id = selected[0]
+        parent_id = self._trans_tree.parent(item_id)
+        if not parent_id:
+            messagebox.showinfo('Select Variant',
+                                'Please select a specific variant, not a transition key.',
+                                parent=self._window)
+            return
+        transition_key = self._trans_tree.item(parent_id, 'text')
+        variant_name = self._trans_tree.item(item_id, 'text')
+        self._open_edit_fps_dialog(transition_key, variant_name, is_transition=True)
+
+    def _open_edit_fps_dialog(self, group_key, variant_name, is_transition):
+        """Small modal to set or clear the 'fps' override on a single variant."""
+        # Look up the current fps (if any) for display.
+        current_fps = None
+        get_variants = (self._callbacks.get('get_transition_variants')
+                        if is_transition
+                        else self._callbacks.get('get_anim_variants'))
+        if get_variants is not None:
+            for v in get_variants(group_key) or []:
+                if v.get('name') == variant_name:
+                    current_fps = v.get('fps')
+                    break
+
+        dialog = tk.Toplevel(self._window)
+        dialog.title('Edit Variant FPS')
+        dialog.geometry('340x160')
+        dialog.resizable(False, False)
+        dialog.transient(self._window)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        kind = 'Transition' if is_transition else 'Animation'
+        ttk.Label(frame, text=f'{kind}: {group_key}').pack(anchor=tk.W)
+        ttk.Label(frame, text=f'Variant: {variant_name}').pack(anchor=tk.W, pady=(0, 6))
+
+        inherited_note = (f'(inherits {config.CAT_FPS} fps)' if current_fps is None
+                          else f'(currently {current_fps} fps)')
+        ttk.Label(frame, text=inherited_note, foreground='gray').pack(anchor=tk.W)
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row, text='FPS:').pack(side=tk.LEFT)
+        fps_var = tk.IntVar(value=int(current_fps) if isinstance(current_fps, int)
+                            else config.CAT_FPS)
+        ttk.Spinbox(row, from_=1, to=60, width=4, textvariable=fps_var) \
+            .pack(side=tk.LEFT, padx=(6, 0))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(12, 0))
+
+        def apply_fps(value):
+            cb = self._callbacks.get('update_variant_fps')
+            if cb is None:
+                messagebox.showerror('Not wired',
+                                     'update_variant_fps callback is missing.',
+                                     parent=dialog)
+                return
+            try:
+                cb(group_key, variant_name, value, is_transition)
+                dialog.destroy()
+            except Exception as e:
+                messagebox.showerror('Error', f'Failed to update FPS:\n{e}',
+                                     parent=dialog)
+
+        ttk.Button(btns, text='OK',
+                   command=lambda: apply_fps(int(fps_var.get()))) \
+            .pack(side=tk.LEFT)
+        ttk.Button(btns, text='Clear override',
+                   command=lambda: apply_fps(None)) \
+            .pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text='Cancel',
+                   command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _on_remove_animation(self):
         """Remove the selected variant from the treeview."""
@@ -649,6 +1087,39 @@ class ControlPanel:
             if 'remove_animation' in self._callbacks:
                 self._callbacks['remove_animation'](anim_type, variant_name)
             self.refresh_animation_list()
+
+    def _on_import_sprite_sheet(self):
+        """Open the visual sprite-sheet importer dialog."""
+        get_manager = self._callbacks.get('get_anim_manager')
+        if not get_manager:
+            messagebox.showerror('Importer unavailable',
+                                 'Animation manager is not wired up.',
+                                 parent=self._window)
+            return
+
+        anim_manager = get_manager()
+        if anim_manager is None:
+            messagebox.showerror('Importer unavailable',
+                                 'Animation manager has not been initialized yet.',
+                                 parent=self._window)
+            return
+
+        # Imported lazily so the control panel can still render even if
+        # numpy or PIL are somehow missing — only the importer needs them.
+        from sprite_sheet_importer import SpriteSheetImporter
+
+        def on_imported():
+            self.refresh_animation_list()
+            self.refresh_transition_list()
+            notify = self._callbacks.get('sprite_sheet_imported')
+            if notify:
+                notify()
+
+        SpriteSheetImporter(
+            parent=self._window,
+            animation_manager=anim_manager,
+            on_imported=on_imported,
+        )
 
     def refresh_animation_list(self):
         """Refresh the treeview with current animation data."""
@@ -681,10 +1152,10 @@ class ControlPanel:
     # --- Transition UI ---
 
     def _on_add_transition(self):
-        """Open dialog to add a new transition variant."""
+        """Open dialog to add a new transition variant (folder or single GIF)."""
         dialog = tk.Toplevel(self._window)
         dialog.title('Add Transition Animation')
-        dialog.geometry('400x180')
+        dialog.geometry('440x280')
         dialog.resizable(False, False)
         dialog.transient(self._window)
         dialog.grab_set()
@@ -692,53 +1163,130 @@ class ControlPanel:
         frame = ttk.Frame(dialog, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Transition key selector
         ttk.Label(frame, text='Transition:').grid(row=0, column=0, sticky=tk.W, pady=4)
         key_var = tk.StringVar(value=TRANSITION_KEYS[0])
-        key_combo = ttk.Combobox(frame, textvariable=key_var,
-                                 values=TRANSITION_KEYS, state='readonly', width=22)
-        key_combo.grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Combobox(frame, textvariable=key_var, values=TRANSITION_KEYS,
+                     state='readonly', width=22) \
+            .grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
 
-        # Variant name
         ttk.Label(frame, text='Variant Name:').grid(row=1, column=0, sticky=tk.W, pady=4)
         name_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=name_var, width=24).grid(
-            row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Entry(frame, textvariable=name_var, width=24) \
+            .grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
 
-        # Folder path
-        ttk.Label(frame, text='Sprite Folder:').grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Label(frame, text='Source:').grid(row=2, column=0, sticky=tk.W, pady=4)
+        source_var = tk.StringVar(value='folder')
+        radio_frame = ttk.Frame(frame)
+        radio_frame.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0), columnspan=2)
+        ttk.Radiobutton(radio_frame, text='Folder of frames', variable=source_var,
+                        value='folder').pack(side=tk.LEFT)
+        ttk.Radiobutton(radio_frame, text='Single GIF file', variable=source_var,
+                        value='gif').pack(side=tk.LEFT, padx=(10, 0))
+
+        path_label = ttk.Label(frame, text='Sprite Folder:')
+        path_label.grid(row=3, column=0, sticky=tk.W, pady=4)
         path_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=path_var, width=24, state='readonly').grid(
-            row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Entry(frame, textvariable=path_var, width=28, state='readonly') \
+            .grid(row=3, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+
+        frames_label = ttk.Label(frame, text='', foreground='gray')
+        frames_label.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        fps_label = ttk.Label(frame, text='FPS:')
+        fps_var = tk.IntVar(value=config.CAT_FPS)
+        fps_spin = ttk.Spinbox(frame, from_=1, to=60, width=4, textvariable=fps_var)
+        fps_hint = ttk.Label(frame, text='fps', foreground='gray')
+        fps_label.grid(row=5, column=0, sticky=tk.W, pady=4)
+        fps_spin.grid(row=5, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        fps_hint.grid(row=5, column=2, sticky=tk.W, pady=4)
+        fps_label.grid_remove()
+        fps_spin.grid_remove()
+        fps_hint.grid_remove()
+
+        gif_meta = {'frame_count': 0}
+
+        def refresh_gif_meta():
+            gif_meta['frame_count'] = 0
+            frames_label.configure(text='')
+            fps_label.grid_remove()
+            fps_spin.grid_remove()
+            fps_hint.grid_remove()
+            if source_var.get() != 'gif':
+                return
+            p = path_var.get().strip()
+            if not p or not os.path.isfile(p):
+                return
+            count, hint = inspect_gif(p)
+            gif_meta['frame_count'] = count
+            if count <= 0:
+                frames_label.configure(text='(could not read GIF)')
+                return
+            frames_label.configure(text=f'Frames: {count}')
+            if count >= 2:
+                fps_var.set(int(hint))
+                fps_label.grid()
+                fps_spin.grid()
+                fps_hint.grid()
 
         def browse():
-            folder = filedialog.askdirectory(
-                title='Select folder with transition sprite frames',
-                parent=dialog
-            )
-            if folder:
-                path_var.set(folder)
+            if source_var.get() == 'gif':
+                picked = filedialog.askopenfilename(
+                    title='Select a GIF file',
+                    parent=dialog,
+                    filetypes=[('GIF images', '*.gif')],
+                )
+            else:
+                picked = filedialog.askdirectory(
+                    title='Select folder with transition sprite frames',
+                    parent=dialog,
+                )
+            if picked:
+                path_var.set(picked)
+                refresh_gif_meta()
 
         ttk.Button(frame, text='Browse...', command=browse).grid(
-            row=2, column=2, padx=(4, 0), pady=4)
+            row=3, column=2, padx=(4, 0), pady=4)
+
+        def on_source_changed(*_):
+            path_var.set('')
+            if source_var.get() == 'gif':
+                path_label.configure(text='GIF File:')
+            else:
+                path_label.configure(text='Sprite Folder:')
+            refresh_gif_meta()
+
+        source_var.trace_add('write', on_source_changed)
 
         def submit():
             transition_key = key_var.get()
             variant_name = name_var.get().strip()
             source_path = path_var.get().strip()
+            source_type = source_var.get()
 
             if not variant_name:
                 messagebox.showwarning('Missing Name', 'Please enter a variant name.',
                                        parent=dialog)
                 return
-            if not source_path or not os.path.isdir(source_path):
-                messagebox.showwarning('Missing Folder', 'Please select a valid sprite folder.',
-                                       parent=dialog)
-                return
 
             try:
-                if 'add_transition' in self._callbacks:
-                    self._callbacks['add_transition'](transition_key, variant_name, source_path)
+                if source_type == 'gif':
+                    if not source_path or not os.path.isfile(source_path):
+                        messagebox.showwarning('Missing GIF',
+                                               'Please select a valid GIF file.',
+                                               parent=dialog)
+                        return
+                    fps = int(fps_var.get()) if gif_meta['frame_count'] >= 2 else None
+                    cb = self._callbacks.get('add_gif_transition')
+                    if cb is None:
+                        raise RuntimeError('add_gif_transition callback not wired')
+                    cb(transition_key, variant_name, source_path, fps)
+                else:
+                    if not source_path or not os.path.isdir(source_path):
+                        messagebox.showwarning('Missing Folder',
+                                               'Please select a valid sprite folder.',
+                                               parent=dialog)
+                        return
+                    if 'add_transition' in self._callbacks:
+                        self._callbacks['add_transition'](transition_key, variant_name, source_path)
                 self.refresh_transition_list()
                 dialog.destroy()
             except Exception as e:
@@ -746,7 +1294,7 @@ class ControlPanel:
                                      parent=dialog)
 
         ttk.Button(frame, text='Add', command=submit).grid(
-            row=3, column=0, columnspan=3, pady=(12, 0))
+            row=6, column=0, columnspan=3, pady=(12, 0))
 
     def _on_remove_transition(self):
         """Remove the selected transition variant."""

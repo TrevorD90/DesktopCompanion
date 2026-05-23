@@ -141,6 +141,7 @@ class SpeechBubble:
 
     def _fade_in(self):
         """Gradually increase alpha from 0.0 to 1.0 over 200ms (10 steps)."""
+        self._fade_timer = None
         if self._fade_step >= 10:
             self._toplevel.attributes('-alpha', 1.0)
             return
@@ -151,9 +152,22 @@ class SpeechBubble:
         self._fade_timer = self._toplevel.after(20, self._fade_in)
 
     def _hide(self):
-        """Hide the bubble window."""
+        """Hide the bubble window. Cancels any in-flight fade timer first
+        so a late fade step doesn't un-hide the bubble after dismiss()."""
         self._visible = False
         if self._toplevel:
+            if self._fade_timer:
+                try:
+                    self._toplevel.after_cancel(self._fade_timer)
+                except Exception:
+                    pass
+                self._fade_timer = None
+            if self._dismiss_timer:
+                try:
+                    self._toplevel.after_cancel(self._dismiss_timer)
+                except Exception:
+                    pass
+                self._dismiss_timer = None
             self._toplevel.attributes('-alpha', 0.0)
             self._toplevel.withdraw()
 

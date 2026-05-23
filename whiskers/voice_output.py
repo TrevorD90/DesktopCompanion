@@ -111,21 +111,31 @@ def _speak_kokoro(text, on_start=None, on_finish=None):
             on_finish()
 
 
+# Cached pyttsx3 engine — init is 200–500 ms on Windows SAPI5; reuse the
+# same engine across every speak() so back-to-back replies don't stall.
+_pyttsx3_engine = None
+
+
+def _get_pyttsx3_engine():
+    global _pyttsx3_engine
+    if _pyttsx3_engine is None:
+        _pyttsx3_engine = pyttsx3.init()
+        rate = _pyttsx3_engine.getProperty('rate')
+        _pyttsx3_engine.setProperty('rate', int(rate * config.KOKORO_SPEED))
+    return _pyttsx3_engine
+
+
 def _speak_pyttsx3(text, on_start=None, on_finish=None):
     """Speak using pyttsx3 as a fallback."""
     text = _clean_for_speech(text)
     try:
-        engine = pyttsx3.init()
-        # Slow down speech slightly for children
-        rate = engine.getProperty('rate')
-        engine.setProperty('rate', int(rate * config.KOKORO_SPEED))
+        engine = _get_pyttsx3_engine()
 
         if on_start:
             on_start()
 
         engine.say(text)
         engine.runAndWait()
-        engine.stop()
 
     except Exception as e:
         print(f'[ERROR] pyttsx3 playback failed: {e}')

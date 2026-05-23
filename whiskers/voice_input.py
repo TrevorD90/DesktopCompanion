@@ -85,17 +85,27 @@ class VoiceInput:
             self._stt_ready.set()
             return
         try:
-            print('[INFO] Loading speech recognition model (one-time)...')
-            self._stt_recorder = AudioToTextRecorder(
+            print('[INFO] Loading speech recognition model (one-time)...', flush=True)
+            stt_kwargs = dict(
                 model=config.WHISPER_MODEL,
                 language=config.WHISPER_LANGUAGE,
                 spinner=False,
                 silero_sensitivity=0.4,
-                post_speech_silence_duration=0.8
+                post_speech_silence_duration=0.8,
             )
-            print('[INFO] Speech recognition ready.')
+            device_index = config.get_setting('input_device_index')
+            if device_index is not None:
+                stt_kwargs['input_device_index'] = int(device_index)
+            self._stt_recorder = AudioToTextRecorder(**stt_kwargs)
+            print('[INFO] Speech recognition ready.', flush=True)
         except Exception as e:
-            print(f'[WARNING] Could not init RealtimeSTT: {e}')
+            # Print a full traceback, not just str(e) — library-level errors
+            # often have opaque str representations (numeric errnos, empty
+            # strings) that obscure the real cause. Logged at ERROR because
+            # this permanently disables voice input for the session.
+            import traceback
+            print(f'[ERROR] RealtimeSTT init FAILED: {type(e).__name__}: {e}', flush=True)
+            traceback.print_exc()
             self._stt_recorder = None
         self._stt_ready.set()
 
@@ -107,9 +117,20 @@ class VoiceInput:
         """Begin background listening (wake word or F9 fallback)."""
         self._running = True
 
+        # Surface uncaught exceptions in background threads — Python's default
+        # hook writes to stderr, which pythonw.exe may silently swallow under
+        # IntelliJ's Run window. Route to stdout via print() so they always show.
+        def _log_thread_exc(args):
+            import traceback as _tb
+            print(f'[ERROR] Uncaught in {args.thread.name}: '
+                  f'{args.exc_type.__name__}: {args.exc_value}', flush=True)
+            _tb.print_tb(args.exc_traceback)
+        threading.excepthook = _log_thread_exc
+
         # Pre-load STT in background so first F9 press is fast
         if _HAS_REALTIMESTT:
-            threading.Thread(target=self._init_stt, daemon=True).start()
+            threading.Thread(target=self._init_stt, daemon=True,
+                             name='STT-Init').start()
 
         if _HAS_OPENWAKEWORD and _HAS_PYAUDIO:
             print('[INFO] Wake word detection active. Say "Hey Whiskers" to start.')
@@ -130,6 +151,7 @@ class VoiceInput:
         settings = config.load_user_settings()
         model_id = settings.get('wake_word_model', 'hey_jarvis_v0.1')
         self._sensitivity = settings.get('wake_word_sensitivity', config.WAKE_WORD_SENSITIVITY)
+        device_index = settings.get('input_device_index')
         print(f'[INFO] Using wake word model: {model_id}')
 
         try:
@@ -146,42 +168,82 @@ class VoiceInput:
                 print('[INFO] Press F9 to talk to Whiskers.')
             return
 
-        # Open audio stream for wake word detection
+        # Open audio stream for wake word detection.
+        # openwakeword is trained on 16 kHz mono; we must feed it at that rate.
+        # WASAPI-only devices (e.g. Intel Smart Sound's WASAPI entry) reject
+        # arbitrary rates — fall back to the system default mic for wake word
+        # if the user's chosen device won't open at 16 kHz.
         pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=1280  # 80ms chunks at 16kHz
-        )
+        stream = None
+        try:
+            open_kwargs = dict(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=16000,
+                input=True,
+                frames_per_buffer=1280,  # 80 ms chunks at 16 kHz
+            )
+            if device_index is not None:
+                open_kwargs['input_device_index'] = int(device_index)
 
-        print('[INFO] Listening for wake word...')
-
-        import numpy as np
-
-        while self._running:
             try:
-                audio_data = stream.read(1280, exception_on_overflow=False)
-                audio_np = np.frombuffer(audio_data, dtype=np.int16)
-
-                prediction = self._oww_model.predict(audio_np)
-
-                for model_name, score in self._oww_model.prediction_buffer.items():
-                    if score[-1] > self._sensitivity:
-                        self._oww_model.reset()
-                        self._handle_wake()
-                        time.sleep(1.0)
-                        break
-
+                stream = pa.open(**open_kwargs)
             except Exception as e:
-                if self._running:
-                    print(f'[ERROR] Wake word loop: {e}')
-                    time.sleep(0.1)
+                dev_hint = (f'device #{device_index}' if device_index is not None
+                            else 'system default')
+                print(f'[WARNING] Could not open {dev_hint} at 16 kHz for wake word ({e}).')
+                if device_index is not None:
+                    # Retry on the system default mic — MME usually accepts 16 kHz.
+                    open_kwargs.pop('input_device_index', None)
+                    try:
+                        stream = pa.open(**open_kwargs)
+                        print('[INFO] Wake word falling back to system default mic. '
+                              'STT (F9 / conversation) still uses your selected device.')
+                    except Exception as e2:
+                        print(f'[ERROR] System default also failed at 16 kHz: {e2}')
+                        stream = None
 
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+            if stream is None:
+                print('[INFO] Falling back to F9 hotkey (no wake-word audio stream).')
+                if _HAS_KEYBOARD:
+                    self._use_hotkey = True
+                    keyboard.on_press_key('F9', lambda _: self._on_hotkey_pressed())
+                    print('[INFO] Press F9 to talk to Whiskers.')
+                return
+
+            print('[INFO] Listening for wake word...')
+
+            import numpy as np
+
+            while self._running:
+                try:
+                    audio_data = stream.read(1280, exception_on_overflow=False)
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16)
+
+                    self._oww_model.predict(audio_np)
+
+                    for _model_name, score in self._oww_model.prediction_buffer.items():
+                        if score[-1] > self._sensitivity:
+                            self._oww_model.reset()
+                            self._handle_wake()
+                            time.sleep(1.0)
+                            break
+
+                except Exception as e:
+                    if self._running:
+                        print(f'[ERROR] Wake word loop: {e}')
+                        time.sleep(0.1)
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
 
     def _on_hotkey_pressed(self):
         """Handle F9 keypress as wake word substitute."""

@@ -34,7 +34,55 @@ TRANSITION_KEYS = [
     'idle_to_happy',     # Start celebrating
     'happy_to_idle',     # Land from jump
     'think_to_talk',     # Lightbulb moment → start speaking
+    'idle_to_jump',      # Crouch → pounce: stand-up into jump
+    'jump_to_idle',      # Land and sit
 ]
+
+
+def _sanitize_variant_name(raw_name):
+    """Keep only alphanumerics, underscore and hyphen in a variant name."""
+    return ''.join(c if c.isalnum() or c in '_-' else '_' for c in raw_name)
+
+
+def inspect_gif(gif_path):
+    """Return (frame_count, fps_hint) for an animated GIF.
+
+    fps_hint averages the non-zero per-frame durations in img.info['duration']
+    (milliseconds) and converts to FPS. Falls back to config.CAT_FPS if the
+    file has no usable duration data. Clamped to [1, 60]. Never raises —
+    returns (0, config.CAT_FPS) if the file can't be opened.
+    """
+    try:
+        img = Image.open(gif_path)
+    except Exception:
+        return 0, config.CAT_FPS
+
+    frame_count = 0
+    durations = []
+    # Hard cap — a malformed/malicious GIF could seek forever and freeze the UI.
+    MAX_FRAMES = 2000
+    try:
+        while frame_count < MAX_FRAMES:
+            frame_count += 1
+            d = img.info.get('duration', 0) or 0
+            if d > 0:
+                durations.append(d)
+            img.seek(img.tell() + 1)
+    except EOFError:
+        pass
+    finally:
+        try:
+            img.close()
+        except Exception:
+            pass
+
+    if durations:
+        avg_ms = sum(durations) / len(durations)
+        fps = int(round(1000.0 / avg_ms)) if avg_ms > 0 else config.CAT_FPS
+    else:
+        fps = config.CAT_FPS
+    fps = max(1, min(60, fps))
+    return frame_count, fps
 
 # Default mapping from CatState values to animation types
 DEFAULT_STATE_TYPE_MAP = {
@@ -290,8 +338,7 @@ class AnimationManager:
         if anim_type not in ANIMATION_TYPES:
             raise ValueError(f'Unknown animation type: {anim_type}')
 
-        # Sanitize variant name
-        safe_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in variant_name)
+        safe_name = _sanitize_variant_name(variant_name)
         dest_dir = os.path.join('assets', 'sprites', anim_type, safe_name)
         os.makedirs(dest_dir, exist_ok=True)
 
@@ -385,7 +432,7 @@ class AnimationManager:
         if transition_key not in TRANSITION_KEYS:
             raise ValueError(f'Unknown transition key: {transition_key}')
 
-        safe_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in variant_name)
+        safe_name = _sanitize_variant_name(variant_name)
         dest_dir = os.path.join('assets', 'sprites', 'transitions', transition_key, safe_name)
         os.makedirs(dest_dir, exist_ok=True)
 
@@ -449,3 +496,167 @@ class AnimationManager:
                 k: len(self._data.get('transitions', {}).get(k, {}).get('variants', []))
                 for k in TRANSITION_KEYS
             }
+
+    # --- PIL-frame registration (used by the sprite-sheet importer) ---
+
+    def register_variant_from_pil_frames(self, anim_type, variant_name, pil_frames):
+        """Persist a list of PIL Image frames as a new animation variant.
+
+        Frames are written as sequentially-numbered PNGs into
+        assets/sprites/<anim_type>/<safe_name>/ and registered as format='frames'.
+        Returns the destination directory path.
+        """
+        if anim_type not in ANIMATION_TYPES:
+            raise ValueError(f'Unknown animation type: {anim_type}')
+        if not pil_frames:
+            raise ValueError('No frames provided.')
+
+        safe_name = _sanitize_variant_name(variant_name)
+        dest_dir = os.path.join('assets', 'sprites', anim_type, safe_name)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        for index, frame in enumerate(pil_frames):
+            frame.save(os.path.join(dest_dir, f'frame_{index:03d}.png'),
+                       format='PNG', optimize=True)
+
+        variant = {'name': safe_name, 'path': dest_dir, 'format': 'frames'}
+        with self._lock:
+            self._data['animations'][anim_type]['variants'].append(variant)
+            self._save_config()
+
+        print(f'[INFO] Registered animation variant from frames: '
+              f'{anim_type}/{safe_name} ({len(pil_frames)} frames)')
+        return dest_dir
+
+    def register_transition_from_pil_frames(self, transition_key, variant_name, pil_frames):
+        """Persist a list of PIL Image frames as a new transition variant.
+
+        Mirror of register_variant_from_pil_frames for the transitions bucket.
+        """
+        if transition_key not in TRANSITION_KEYS:
+            raise ValueError(f'Unknown transition key: {transition_key}')
+        if not pil_frames:
+            raise ValueError('No frames provided.')
+
+        safe_name = _sanitize_variant_name(variant_name)
+        dest_dir = os.path.join('assets', 'sprites', 'transitions', transition_key, safe_name)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        for index, frame in enumerate(pil_frames):
+            frame.save(os.path.join(dest_dir, f'frame_{index:03d}.png'),
+                       format='PNG', optimize=True)
+
+        variant = {'name': safe_name, 'path': dest_dir, 'format': 'frames'}
+        with self._lock:
+            self._data['transitions'][transition_key]['variants'].append(variant)
+            self._save_config()
+
+        print(f'[INFO] Registered transition variant from frames: '
+              f'{transition_key}/{safe_name} ({len(pil_frames)} frames)')
+        return dest_dir
+
+    # --- GIF-file registration (single-file import, optional per-variant FPS) ---
+
+    def register_gif_file_variant(self, anim_type, variant_name, source_gif_path, fps=None):
+        """Register a single .gif file as an animation variant.
+
+        Copies the gif into assets/sprites/<anim_type>/<safe_name>/ and records
+        a variant dict with format='gif'. If fps is provided, stores it on the
+        variant so playback uses that rate regardless of the type-level override.
+        """
+        if anim_type not in ANIMATION_TYPES:
+            raise ValueError(f'Unknown animation type: {anim_type}')
+        if not source_gif_path or not os.path.isfile(source_gif_path):
+            raise ValueError(f'GIF file not found: {source_gif_path}')
+        if not source_gif_path.lower().endswith('.gif'):
+            raise ValueError(f'Not a .gif file: {source_gif_path}')
+
+        safe_name = _sanitize_variant_name(variant_name)
+        dest_dir = os.path.join('assets', 'sprites', anim_type, safe_name)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        dest_file = os.path.join(dest_dir, os.path.basename(source_gif_path))
+        shutil.copy2(source_gif_path, dest_file)
+
+        variant = {
+            'name': safe_name,
+            'path': dest_dir,
+            'format': 'gif',
+            'file': dest_file,
+        }
+        if fps is not None:
+            variant['fps'] = max(1, min(60, int(fps)))
+
+        with self._lock:
+            self._data['animations'][anim_type]['variants'].append(variant)
+            self._save_config()
+
+        print(f'[INFO] Registered GIF animation variant: '
+              f'{anim_type}/{safe_name} (fps={variant.get("fps", "inherit")})')
+        return dest_dir
+
+    def register_gif_file_transition(self, transition_key, variant_name,
+                                     source_gif_path, fps=None):
+        """Register a single .gif file as a transition variant."""
+        if transition_key not in TRANSITION_KEYS:
+            raise ValueError(f'Unknown transition key: {transition_key}')
+        if not source_gif_path or not os.path.isfile(source_gif_path):
+            raise ValueError(f'GIF file not found: {source_gif_path}')
+        if not source_gif_path.lower().endswith('.gif'):
+            raise ValueError(f'Not a .gif file: {source_gif_path}')
+
+        safe_name = _sanitize_variant_name(variant_name)
+        dest_dir = os.path.join('assets', 'sprites', 'transitions',
+                                transition_key, safe_name)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        dest_file = os.path.join(dest_dir, os.path.basename(source_gif_path))
+        shutil.copy2(source_gif_path, dest_file)
+
+        variant = {
+            'name': safe_name,
+            'path': dest_dir,
+            'format': 'gif',
+            'file': dest_file,
+        }
+        if fps is not None:
+            variant['fps'] = max(1, min(60, int(fps)))
+
+        with self._lock:
+            self._data['transitions'][transition_key]['variants'].append(variant)
+            self._save_config()
+
+        print(f'[INFO] Registered GIF transition variant: '
+              f'{transition_key}/{safe_name} (fps={variant.get("fps", "inherit")})')
+        return dest_dir
+
+    def update_variant_fps(self, group_key, variant_name, fps, is_transition=False):
+        """Set or clear the 'fps' override on a specific variant in place.
+
+        Args:
+            group_key: animation type (e.g. 'walk') or transition key
+                       (e.g. 'idle_to_walk') depending on is_transition.
+            variant_name: the variant's name (post-sanitization).
+            fps: int to set, or None to remove the override.
+            is_transition: True to update in the transitions bucket.
+
+        Returns True if a variant was found and updated, else False.
+        """
+        bucket = 'transitions' if is_transition else 'animations'
+        with self._lock:
+            variants = self._data.get(bucket, {}).get(group_key, {}).get('variants', [])
+            updated = False
+            for v in variants:
+                if v.get('name') == variant_name:
+                    if fps is None:
+                        v.pop('fps', None)
+                    else:
+                        v['fps'] = max(1, min(60, int(fps)))
+                    updated = True
+                    break
+            if updated:
+                self._save_config()
+        if updated:
+            print(f'[INFO] Updated variant fps: {bucket}/{group_key}/{variant_name} '
+                  f'-> {fps if fps is not None else "inherit"}')
+        return updated

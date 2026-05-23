@@ -2,10 +2,32 @@
 # Wires all components together and manages the application state machine.
 
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
+
+# When launched by IntelliJ or a .pyw shortcut, sys.executable is pythonw.exe —
+# the windowless interpreter. multiprocessing's spawn (used by RealtimeSTT via
+# torch.multiprocessing) inherits this binary for child workers, and those
+# children deadlock on Windows because they can't inherit console handles or
+# get usable stdin/stdout pipes. Re-point to python.exe across every mechanism
+# that reads the interpreter path: sys.executable itself (most direct) and
+# multiprocessing.set_executable() (belt-and-suspenders, in case something
+# captures it before we patch sys.executable).
+if sys.platform == 'win32' and sys.executable.lower().endswith('pythonw.exe'):
+    _console_python = sys.executable[:-5] + '.exe'  # pythonw.exe → python.exe
+    if os.path.exists(_console_python):
+        print(f'[INFO] Re-pointing child processes from pythonw.exe to {_console_python} '
+              f'(avoids RealtimeSTT multiprocessing deadlock).', flush=True)
+        sys.executable = _console_python
+        import multiprocessing
+        multiprocessing.set_executable(_console_python)
+    else:
+        print(f'[WARNING] pythonw.exe detected but sibling python.exe not found at '
+              f'{_console_python}. RealtimeSTT may hang on STT init.', flush=True)
 
 # Print banner early so the user sees something immediately
 print('=' * 50)
@@ -28,18 +50,16 @@ if _missing:
     print('[INFO] Run: pip install -r requirements.txt')
     sys.exit(1)
 
-import requests
+import config  # light: only used for path/url constants, safe to import anywhere
 
-import config
-import memory_manager
-import voice_output
-from ai_brain import AIBrain
-from animation_manager import AnimationManager
-from cat_window import CatWindow, CatState
-from control_panel import ControlPanel
-from speech_bubble import SpeechBubble
-from tray_icon import TrayIcon
-from voice_input import VoiceInput
+# IMPORTANT — all heavy imports are gated on `__name__ == '__main__'` below.
+# When RealtimeSTT spawns a Windows child process for its transcription worker,
+# Python re-imports this script with `__name__ == '__mp_main__'`. If the heavy
+# imports (voice_output → Kokoro/torch, cat_window → Tkinter, etc.) were at
+# module level, they'd re-run in the child and deadlock on Kokoro/torch init.
+# Gating them means the child imports cheaply and doesn't touch Whiskers' GUI
+# stack. The Whiskers class below references these names at call time, so it
+# still works as long as the imports run before `app.run()` in the parent.
 
 
 # Application states (maps to design doc Table 5)
@@ -70,21 +90,141 @@ class Whiskers:
         self._awaiting_name = False
         self._convo_idle_timer = None
         self._in_conversation = False  # Tracks conversation mode across state changes
+        # Set only when this Whiskers process launched Ollama itself (not when
+        # Ollama was already running). Used on shutdown to only terminate what
+        # we own, leaving any user-managed Ollama instance alone.
+        self._ollama_proc = None
 
-    # --- Ollama check ---
+    # --- Ollama supervisor ---
 
-    def _check_ollama(self):
-        """Verify Ollama is running by hitting GET /api/tags."""
+    def _ollama_reachable(self, timeout=2):
+        """Return True if Ollama's API responds at OLLAMA_BASE_URL. No logging."""
         try:
-            resp = requests.get(f'{config.OLLAMA_BASE_URL}/api/tags', timeout=5)
+            resp = requests.get(f'{config.OLLAMA_BASE_URL}/api/tags', timeout=timeout)
             resp.raise_for_status()
-            print('[INFO] Ollama is running.')
             return True
         except Exception:
-            print('[WARNING] Ollama is not running or unreachable at', config.OLLAMA_BASE_URL)
-            print('[INFO] Whiskers will still start, but AI responses will be unavailable.')
-            print('[INFO] Start Ollama with: ollama serve')
             return False
+
+    def _resolve_ollama_exe(self):
+        """Find ollama.exe. PATH first, then the default installer location."""
+        hit = shutil.which('ollama')
+        if hit:
+            return hit
+        default = r'C:\Users\seren\AppData\Local\Programs\Ollama\ollama.exe'
+        if os.path.exists(default):
+            return default
+        return None
+
+    def _start_ollama_if_needed(self, ready_timeout=30):
+        """Ensure Ollama is reachable. Spawn `ollama serve` if it isn't.
+
+        Sets self._ollama_proc only when we launch the process ourselves so
+        _stop_ollama_if_owned leaves externally-managed Ollama instances alone.
+        Always returns — never blocks Whiskers from starting even if Ollama fails.
+        """
+        if self._ollama_reachable():
+            print('[INFO] Ollama already running.')
+            return True
+
+        exe = self._resolve_ollama_exe()
+        if not exe:
+            print('[WARNING] Ollama not running and ollama.exe not found on PATH '
+                  'or at the default install location.')
+            print('[INFO] Install Ollama from https://ollama.com/download/windows '
+                  'or add it to PATH. Whiskers will start without AI responses.')
+            return False
+
+        print(f'[INFO] Ollama not running — launching `{os.path.basename(exe)} serve` in the background...')
+        # CREATE_NO_WINDOW: no console flash. DETACHED_PROCESS: survives if our
+        # parent console goes away (e.g. IDE Run window closing) — we still own
+        # the handle for later termination.
+        flags = 0
+        if sys.platform == 'win32':
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        try:
+            self._ollama_proc = subprocess.Popen(
+                [exe, 'serve'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+            )
+        except Exception as e:
+            print(f'[ERROR] Failed to spawn Ollama: {type(e).__name__}: {e}')
+            self._ollama_proc = None
+            return False
+
+        # Poll until the API responds. Print progress at every 2-second mark.
+        deadline = time.time() + ready_timeout
+        last_log = 0.0
+        while time.time() < deadline:
+            if self._ollama_reachable(timeout=1):
+                elapsed = int(time.time() - (deadline - ready_timeout))
+                print(f'[INFO] Ollama ready ({elapsed}s).')
+                return True
+            now = time.time()
+            if now - last_log > 2:
+                elapsed = int(now - (deadline - ready_timeout))
+                print(f'[INFO] Starting Ollama ({elapsed}s)...')
+                last_log = now
+            time.sleep(0.5)
+
+        print(f'[WARNING] Ollama did not respond within {ready_timeout}s. '
+              'Leaving the process running — Whiskers will work without AI '
+              'until Ollama finishes initializing.')
+        return False
+
+    def _stop_ollama_if_owned(self):
+        """Terminate the Ollama subprocess only if we spawned it."""
+        proc = self._ollama_proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            # Already exited.
+            self._ollama_proc = None
+            return
+        print('[INFO] Stopping Ollama subprocess...')
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception as e:
+            print(f'[WARNING] Error stopping Ollama: {type(e).__name__}: {e}')
+        self._ollama_proc = None
+
+    def _warmup_ollama_async(self):
+        """Fire-and-forget model preload so the first user query isn't cold.
+
+        Runs in a daemon thread — main Whiskers startup doesn't wait for this.
+        Uses keep_alive=10m so the model stays resident between queries.
+        """
+        def _warmup():
+            model = config.OLLAMA_MODEL
+            print(f'[INFO] Warming up {model} in background...')
+            t0 = time.time()
+            try:
+                resp = requests.post(
+                    f'{config.OLLAMA_BASE_URL}/api/generate',
+                    json={
+                        'model': model,
+                        'prompt': '',
+                        'stream': False,
+                        'keep_alive': '10m',
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                print(f'[INFO] {model} loaded ({time.time() - t0:.1f}s). '
+                      f'First query will be fast.')
+            except Exception as e:
+                # Non-fatal — the first real query will just be slower.
+                print(f'[WARNING] Model warmup failed ({type(e).__name__}: {e}). '
+                      'First query will load the model on demand.')
+        threading.Thread(target=_warmup, daemon=True, name='Ollama-Warmup').start()
 
     # --- Voice input callbacks ---
 
@@ -102,7 +242,7 @@ class Whiskers:
     def _on_recording_start(self):
         """Callback: recording has begun."""
         self._cancel_convo_idle_timer()
-        if self._state == AppState.CONVERSING:
+        if self._state == AppState.CONVERSING and self._cat:
             self._cat.set_state(CatState.LISTEN)
         self._state = AppState.LISTENING
         print('[EVENT] Recording started.')
@@ -184,8 +324,10 @@ class Whiskers:
     def _process_response(self, transcribed_text):
         """Get AI response and speak it. Runs in a worker thread.
 
-        Uses streaming to start speaking the first sentence faster,
-        while collecting the rest in the background.
+        Collects the full streaming response before speaking so the TTS
+        engine can synthesize it as one coherent utterance. Streaming
+        primarily helps the LLM pipeline run concurrently with I/O here,
+        not latency-to-first-audio.
         """
         if not self._cat or not self._running:
             return
@@ -199,7 +341,7 @@ class Whiskers:
         cat.set_state(CatState.THINK)
         bubble.show('Hmm, let me think...')
 
-        # Collect all sentences from the streaming LLM response
+        # Consume the entire streaming response before handing off to TTS.
         sentences = list(self._brain.get_response_stream(transcribed_text))
         full_response = ' '.join(sentences) if sentences else ''
 
@@ -229,7 +371,7 @@ class Whiskers:
                              'you got it', 'fantastic']
         if any(w in full_response.lower() for w in celebration_words):
             self._state = AppState.CELEBRATING
-            cat.show_happy_animation()
+            cat.show_happy_then_revert_to_idle()
             time.sleep(2.0)
 
         if not self._running or not self._cat:
@@ -339,6 +481,13 @@ class Whiskers:
             'change_wake_word': self._on_wake_word_changed,
             'change_sensitivity': self._on_sensitivity_changed,
             'change_quiet_words': self._on_quiet_words_changed,
+            'get_anim_manager': lambda: self._anim_manager,
+            'sprite_sheet_imported': self._on_sprite_sheet_imported,
+            'set_animation_fps': self._cat.set_animation_fps,
+            'add_gif_animation': self._on_gif_animation_added,
+            'add_gif_transition': self._on_gif_transition_added,
+            'update_variant_fps': self._on_variant_fps_updated,
+            'change_mic_device': self._on_mic_device_changed,
         })
 
         # Start voice input
@@ -407,6 +556,11 @@ class Whiskers:
             print('[INFO] Cat is already stopped.')
             return
 
+        # Cancel the conversation-idle timer BEFORE destroying self._cat;
+        # otherwise the timer fires later and crashes on self._cat.set_state().
+        self._cancel_convo_idle_timer()
+        self._in_conversation = False
+
         if self._voice_in:
             self._voice_in.stop()
             self._voice_in = None
@@ -459,6 +613,37 @@ class Whiskers:
         """Handle transition removal from control panel."""
         self._anim_manager.remove_transition(transition_key, variant_name)
 
+    def _on_gif_animation_added(self, anim_type, variant_name, gif_path, fps):
+        """Register a single-GIF animation variant and refresh the cat's sprites."""
+        self._anim_manager.register_gif_file_variant(anim_type, variant_name, gif_path, fps)
+        if self._cat:
+            self._cat.reload_sprites()
+
+    def _on_gif_transition_added(self, transition_key, variant_name, gif_path, fps):
+        """Register a single-GIF transition variant (no reload needed — resolved on demand)."""
+        self._anim_manager.register_gif_file_transition(
+            transition_key, variant_name, gif_path, fps)
+
+    def _on_variant_fps_updated(self, group_key, variant_name, fps, is_transition):
+        """Update a specific variant's fps override; reload sprites for animations
+        so an already-picked variant's in-memory dict reflects the new fps."""
+        self._anim_manager.update_variant_fps(group_key, variant_name, fps, is_transition)
+        if self._cat and not is_transition:
+            self._cat.reload_sprites()
+
+    def _on_mic_device_changed(self, device_index):
+        """Persist the chosen input device. Takes effect on the next Start cycle."""
+        config.set_setting('input_device_index', device_index)
+        dev_hint = (f'device #{device_index}' if device_index is not None
+                    else 'system default')
+        print(f'[INFO] Mic input device set to {dev_hint}. '
+              'Click Stop then Start to apply to voice input.')
+
+    def _on_sprite_sheet_imported(self):
+        """Reload the cat window's sprites after the importer has registered new variants."""
+        if self._cat:
+            self._cat.reload_sprites()
+
     def _on_wake_word_changed(self, model_id):
         """Handle wake word model selection from control panel."""
         config.set_setting('wake_word_model', model_id)
@@ -493,13 +678,12 @@ class Whiskers:
         if self._tray:
             self._tray.stop()
 
-        # Save memory
-        try:
-            memory = memory_manager.load_memory()
-            memory_manager.save_memory(memory)
-            print('[INFO] Memory saved.')
-        except Exception as e:
-            print(f'[WARNING] Could not save memory: {e}')
+        # Stop the Ollama subprocess if we spawned it — leave externally-managed
+        # instances alone (see _stop_ollama_if_owned).
+        self._stop_ollama_if_owned()
+
+        # Memory is already persisted on every write (save_memory in callbacks)
+        # so there's nothing to flush on shutdown.
 
         print('[INFO] Whiskers says goodbye!')
         sys.exit(0)
@@ -517,8 +701,10 @@ class Whiskers:
         self._anim_manager = AnimationManager()
         print('[INFO] Animation manager loaded.')
 
-        # Step 2: Check Ollama
-        self._check_ollama()
+        # Step 2: Ensure Ollama is running; spawn `ollama serve` if missing.
+        # Then kick off a background model warmup so the first query isn't cold.
+        if self._start_ollama_if_needed():
+            self._warmup_ollama_async()
 
         # Step 3: Load student memory
         memory = memory_manager.load_memory()
@@ -566,5 +752,18 @@ class Whiskers:
 
 
 if __name__ == '__main__':
+    # Heavy imports moved here — see comment block near the top of the file.
+    import requests  # noqa: F401 — imported so Whiskers._check_ollama finds it at call time
+
+    import memory_manager
+    import voice_output
+    from ai_brain import AIBrain
+    from animation_manager import AnimationManager
+    from cat_window import CatWindow, CatState
+    from control_panel import ControlPanel
+    from speech_bubble import SpeechBubble
+    from tray_icon import TrayIcon
+    from voice_input import VoiceInput
+
     app = Whiskers()
     app.run()

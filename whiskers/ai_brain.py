@@ -2,6 +2,7 @@
 # Supports: Local Ollama, OpenAI API, Anthropic Claude API
 
 import json
+import time
 from collections import deque
 
 import requests
@@ -91,61 +92,6 @@ class AIBrain:
     def mode(self):
         return self._mode
 
-    def get_response(self, user_message: str) -> str:
-        """Send a message to Ollama and return the AI response.
-
-        Appends user and assistant messages to history.
-        Streams the response for lower latency.
-        Returns friendly fallback if Ollama is unreachable.
-        """
-        # Add user message to history
-        self._history.append({'role': 'user', 'content': user_message})
-
-        # Build the messages list: system prompt first, then history
-        messages = [{'role': 'system', 'content': self._system_prompt}]
-        messages.extend(list(self._history))
-
-        try:
-            response = requests.post(
-                f'{config.OLLAMA_BASE_URL}/api/chat',
-                json={
-                    'model': config.OLLAMA_MODEL,
-                    'messages': messages,
-                    'stream': True
-                },
-                timeout=config.OLLAMA_TIMEOUT,
-                stream=True
-            )
-            response.raise_for_status()
-
-            # Stream and accumulate the response
-            full_response = ''
-            for line in response.iter_lines():
-                if line:
-                    chunk = json.loads(line)
-                    if 'message' in chunk and 'content' in chunk['message']:
-                        full_response += chunk['message']['content']
-                    # Stop if the model signals it's done
-                    if chunk.get('done', False):
-                        break
-
-            # Add assistant response to history
-            if full_response:
-                self._history.append({'role': 'assistant', 'content': full_response})
-
-            return full_response if full_response else 'I got a little confused. Can you ask me again?'
-
-        except requests.ConnectionError:
-            self._history.pop()  # Remove the user message since we have no response
-            return 'I am having a little nap right now. Can you start Ollama and try again?'
-        except requests.Timeout:
-            self._history.pop()
-            return 'I am having a little nap right now. Can you start Ollama and try again?'
-        except Exception as e:
-            self._history.pop()
-            print(f'[ERROR] AIBrain.get_response: {e}')
-            return 'I am having a little nap right now. Can you start Ollama and try again?'
-
     def get_response_stream(self, user_message: str):
         """Yield complete sentences as the LLM generates them.
 
@@ -221,16 +167,29 @@ class AIBrain:
         """Stream tokens from local Ollama."""
         messages = self._build_messages()
 
-        response = requests.post(
-            f'{config.OLLAMA_BASE_URL}/api/chat',
-            json={
-                'model': config.OLLAMA_MODEL,
-                'messages': messages,
-                'stream': True
-            },
-            timeout=config.OLLAMA_TIMEOUT,
-            stream=True
-        )
+        def _post():
+            return requests.post(
+                f'{config.OLLAMA_BASE_URL}/api/chat',
+                json={
+                    'model': config.OLLAMA_MODEL,
+                    'messages': messages,
+                    'stream': True,
+                    # Keep Whiskers short: 1-3 sentences. Match the OpenAI/Anthropic cap.
+                    'options': {'num_predict': 200},
+                },
+                timeout=config.OLLAMA_TIMEOUT,
+                stream=True
+            )
+
+        # One retry with a 2s delay on connection-refused: covers the narrow
+        # window where Ollama restarted (e.g. user ran `ollama stop`) between
+        # warmup and this call. Don't retry on other errors — a malformed
+        # prompt or 5xx shouldn't silently double up.
+        try:
+            response = _post()
+        except requests.ConnectionError:
+            time.sleep(2)
+            response = _post()
         response.raise_for_status()
 
         def token_gen():
