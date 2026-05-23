@@ -11,10 +11,13 @@ venv/
 # Claude
 .claude/
 
-# Data (user-specific)
+# Data (user-specific, runtime)
 whiskers/data/user_settings.json
 whiskers/data/student_memory.json
 whiskers/data/conversation_log.json
+whiskers/data/tts_cache/
+whiskers/data/uploads/
+/data/
 
 # Logs
 *.log

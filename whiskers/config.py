@@ -1,15 +1,11 @@
-# config.py — All configurable settings for Whiskers
+# config.py — Configuration for the Socratic tutor.
+#
+# Pure constants live here; runtime-mutable settings live in
+# data/user_settings.json (accessed via load/save/get/set_setting below).
 
-# Student profile
-STUDENT_NAME = "your child's name"      # Change this
-STUDENT_GRADE = '4th grade'             # Change this
-STUDENT_AGE = 9                         # Change this
+# --- Wake word ------------------------------------------------------------
 
-# Wake word
-WAKE_WORD = 'hey whiskers'              # Phrase to activate the cat
-WAKE_WORD_SENSITIVITY = 0.5             # 0.0 (never) to 1.0 (always)
-
-# Available openwakeword models (model_id, display_phrase)
+WAKE_WORD_SENSITIVITY = 0.5
 WAKE_WORD_MODELS = [
     ('alexa_v0.1',       'Alexa'),
     ('hey_mycroft_v0.1', 'Hey Mycroft'),
@@ -17,34 +13,21 @@ WAKE_WORD_MODELS = [
     ('hey_rhasspy_v0.1', 'Hey Rhasspy'),
 ]
 
-# Quiet words to exit conversation mode
-QUIET_WORDS = ['goodbye', 'bye', "that's all", 'bye whiskers', 'see you later']
+# --- Whisper STT ----------------------------------------------------------
 
-# Whisper speech recognition
-WHISPER_MODEL = 'tiny'                  # tiny (fast) / base / small (accurate)
+WHISPER_MODEL = 'tiny'        # tiny (fast) / base / small (more accurate)
 WHISPER_LANGUAGE = 'en'
 
-# AI providers
-AI_PROVIDERS = [
-    ('ollama',    'Local (Ollama)'),
-    ('openai',    'OpenAI (Cloud)'),
-    ('anthropic', 'Anthropic Claude (Cloud)'),
-]
+# --- Anthropic Claude -----------------------------------------------------
 
-# Ollama AI brain
-OLLAMA_BASE_URL = 'http://localhost:11434'
-OLLAMA_MODEL = 'llama3.2:3b'            # or gemma3:9b, phi4:3.8b
-OLLAMA_TIMEOUT = 60
-
-# Cloud AI models
-OPENAI_MODEL = 'gpt-4o-mini'
 ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'
 
-# Kokoro TTS
-KOKORO_VOICE = 'af_bella'               # Warm female voice (default)
-KOKORO_SPEED = 0.95                     # Slightly slower for children
-KOKORO_LANG = 'a'                       # 'a' = American English
-KOKORO_VOICES = [                        # Available voices for the settings panel
+# --- Kokoro TTS -----------------------------------------------------------
+
+KOKORO_VOICE = 'af_bella'
+KOKORO_SPEED = 0.95           # Slightly slower; easier for a child to follow.
+KOKORO_LANG = 'a'             # 'a' = American English
+KOKORO_VOICES = [
     # American Female
     ('af_alloy',    'Alloy (American Female)'),
     ('af_aoede',    'Aoede (American Female)'),
@@ -78,46 +61,36 @@ KOKORO_VOICES = [                        # Available voices for the settings pan
     ('bm_lewis',    'Lewis (British Male)'),
 ]
 
-# Cat window
-CAT_SCALE = 3                           # Sprite scaling factor (1-5)
-CAT_START_X = 100                       # Initial X position
-CAT_START_Y = 600                       # Initial Y position
-CAT_WALK_SPEED = 3                      # Pixels per frame
-CAT_FPS = 12                            # Animation frames per second
+# --- User settings persistence -------------------------------------------
 
-# Sprite file paths (user supplies GIF files)
-SPRITE_IDLE      = 'assets/sprites/idle.gif'
-SPRITE_WALK_R    = 'assets/sprites/walk_right.gif'
-SPRITE_WALK_L    = 'assets/sprites/walk_left.gif'
-SPRITE_SLEEP     = 'assets/sprites/sleep.gif'
-SPRITE_LISTEN    = 'assets/sprites/listen.gif'
-SPRITE_THINK     = 'assets/sprites/think.gif'
-SPRITE_TALK      = 'assets/sprites/talk.gif'
-SPRITE_HAPPY     = 'assets/sprites/happy.gif'
-
-# Animation manager
-ANIMATIONS_CONFIG = 'data/animations.json'
-
-# System tray icon
-TRAY_ICON_PATH = 'assets/icon.png'
-
-# Memory / data paths
-MEMORY_FILE = 'data/student_memory.json'
-LOG_FILE    = 'data/conversation_log.json'
-
-# User settings persistence
 SETTINGS_FILE = 'data/user_settings.json'
 
 
 def _default_user_settings():
     return {
-        'ai_provider': 'ollama',
-        'openai_api_key': '',
         'anthropic_api_key': '',
         'wake_word_model': 'hey_jarvis_v0.1',
         'wake_word_sensitivity': WAKE_WORD_SENSITIVITY,
-        'quiet_words': list(QUIET_WORDS),
+        # TTS — ElevenLabs is the default for inflection quality. Falls back
+        # to Kokoro (local, unlimited) on quota errors or missing key.
+        'tts_provider': 'elevenlabs',          # 'elevenlabs' or 'kokoro'
+        'elevenlabs_api_key': '',
+        'elevenlabs_voice_id': '',             # blank = auto-pick first from /v1/voices
+        'elevenlabs_model': 'eleven_multilingual_v2',
+        'kokoro_voice': KOKORO_VOICE,
+        'known_speakers': ['Rowan', 'Liam'],
+        'name_pronunciations': {'Rowan': 'Roe-when'},
     }
+
+
+# ElevenLabs models exposed in the settings UI. eleven_v3 is highest-quality
+# but slower; eleven_flash_v2_5 is fastest. multilingual_v2 is the balanced default.
+ELEVENLABS_MODELS = [
+    ('eleven_multilingual_v2', 'Multilingual v2 (balanced, recommended)'),
+    ('eleven_v3',              'v3 (best inflection, slower)'),
+    ('eleven_flash_v2_5',      'Flash v2.5 (fastest, lower quality)'),
+    ('eleven_turbo_v2_5',      'Turbo v2.5 (fast, mid quality)'),
+]
 
 
 def load_user_settings():
@@ -127,14 +100,12 @@ def load_user_settings():
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # Fill in any missing keys from defaults
         for k, v in _default_user_settings().items():
             data.setdefault(k, v)
         return data
-    else:
-        data = _default_user_settings()
-        save_user_settings(data)
-        return data
+    data = _default_user_settings()
+    save_user_settings(data)
+    return data
 
 
 def save_user_settings(settings):
@@ -146,21 +117,11 @@ def save_user_settings(settings):
 
 
 def get_setting(key, default=None):
-    """Get a single setting value."""
     settings = load_user_settings()
     return settings.get(key, default)
 
 
 def set_setting(key, value):
-    """Set a single setting value and save."""
     settings = load_user_settings()
     settings[key] = value
     save_user_settings(settings)
-
-
-# Speech bubble
-BUBBLE_MAX_WIDTH = 320                  # Pixels
-BUBBLE_FONT_SIZE = 12
-BUBBLE_BG_COLOR  = '#FFFDE7'
-BUBBLE_TEXT_COLOR = '#1A1A2E'
-BUBBLE_DURATION  = 8000                 # ms to show bubble

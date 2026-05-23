@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Whiskers — Socratic Tutor</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Whiskers tutor</h1>
+
+    <div class="speaker-row" id="speaker-row" aria-label="Current speaker">
+      <span class="label">Speaker:</span>
+      <div class="speaker-pills" id="speaker-pills"></div>
+      <button class="add-speaker" id="btn-add-speaker" title="Add a brother">+ add</button>
+    </div>
+
+    <div class="mic-row">
+      <button id="btn-mic" class="mic-button">Start listening</button>
+      <span id="mic-status" class="mic-status idle">idle</span>
+      <button id="btn-errors" class="errors-button" title="View server errors">
+        Errors <span id="errors-count" class="errors-badge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="problem-pane" aria-label="Current problem">
+      <div class="problem-header">
+        <button id="btn-prev" aria-label="Previous problem">‹</button>
+        <span id="problem-indicator">No coursework loaded</span>
+        <button id="btn-next" aria-label="Next problem">›</button>
+      </div>
+      <div id="problem-body" class="problem-body">
+        <p class="muted">Upload a worksheet, take a photo, or paste a question to get started.</p>
+      </div>
+
+      <div class="upload-controls">
+        <label class="upload-button">
+          Upload file (PDF / photo / text)
+          <input id="file-input" type="file" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.txt,.md" hidden />
+        </label>
+        <details>
+          <summary>or paste text</summary>
+          <textarea id="paste-text" placeholder="Paste problems here, one per numbered line..."></textarea>
+          <button id="btn-paste-submit">Use this text</button>
+        </details>
+      </div>
+
+      <ol id="problem-list" class="problem-list" aria-label="All problems"></ol>
+    </section>
+
+    <section class="transcript-pane" aria-label="Conversation transcript">
+      <div class="transcript-header">
+        <h2>Transcript</h2>
+        <span id="voice-indicator" class="voice-indicator" title="Active TTS provider and voice">—</span>
+      </div>
+      <div id="transcript" class="transcript"></div>
+      <form id="message-form" class="message-form">
+        <input id="message-input" type="text" placeholder="Type a message (or use the mic)…" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <details class="settings">
+    <summary>⚙ Settings</summary>
+    <div class="settings-body">
+      <label>
+        Anthropic API key
+        <input id="settings-api-key" type="password" placeholder="sk-ant-..." />
+        <span id="settings-api-key-status" class="muted"></span>
+      </label>
+      <label>
+        TTS provider
+        <select id="settings-tts-provider">
+          <option value="elevenlabs">ElevenLabs (better inflection)</option>
+          <option value="kokoro">Kokoro (local, unlimited)</option>
+        </select>
+      </label>
+
+      <fieldset class="elevenlabs-block">
+        <legend>ElevenLabs</legend>
+        <label>
+          API key
+          <input id="settings-el-key" type="password" placeholder="sk_..." />
+          <span id="settings-el-key-status" class="muted"></span>
+        </label>
+        <label>
+          Voice
+          <div class="voice-row">
+            <select id="settings-el-voice"></select>
+            <button id="btn-el-refresh-voices" type="button" class="small">Refresh</button>
+          </div>
+        </label>
+        <label>
+          Model
+          <select id="settings-el-model"></select>
+        </label>
+        <div class="usage-row">
+          <div class="usage-line">
+            <span id="el-usage-text" class="muted">Usage: not loaded</span>
+            <button id="btn-el-refresh-usage" type="button" class="small">Refresh usage</button>
+          </div>
+          <div class="usage-bar"><div id="el-usage-bar-fill" class="usage-bar-fill"></div></div>
+          <span id="el-usage-reset" class="muted"></span>
+        </div>
+      </fieldset>
+
+      <label>
+        Kokoro voice (fallback when ElevenLabs is unavailable)
+        <select id="settings-voice"></select>
+      </label>
+      <label>
+        Wake-word sensitivity
+        <input id="settings-sensitivity" type="range" min="0" max="1" step="0.05" />
+        <span id="settings-sensitivity-value">0.50</span>
+      </label>
+
+      <fieldset class="pronunciations">
+        <legend>Name pronunciations (TTS only — transcript shows real spelling)</legend>
+        <div id="pronunciations-list"></div>
+      </fieldset>
+
+      <button id="btn-save-settings" type="button">Save settings</button>
+      <span id="settings-saved" class="muted"></span>
+    </div>
+  </details>
+
+  <dialog id="errors-dialog" class="wide-dialog">
+    <h3>Error log</h3>
+    <p class="muted" id="errors-empty" hidden>No errors recorded.</p>
+    <ol id="errors-list" class="errors-list"></ol>
+    <menu>
+      <button id="btn-errors-clear" value="clear">Clear log</button>
+      <button id="btn-errors-close" value="close">Close</button>
+    </menu>
+  </dialog>
+
+  <dialog id="add-speaker-dialog">
+    <form method="dialog">
+      <h3>Add a speaker</h3>
+      <label>Name<input id="add-speaker-name" type="text" required /></label>
+      <label>Pronunciation (optional)<input id="add-speaker-pronunciation" type="text" placeholder="e.g. Lee-um" /></label>
+      <menu>
+        <button value="cancel">Cancel</button>
+        <button id="add-speaker-confirm" value="confirm">Add</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
